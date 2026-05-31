@@ -1,8 +1,13 @@
 # webrtcast
 
-A small Go module for streaming H.264 video to WebRTC viewers. A `VideoSource`
-(e.g. FFmpeg) produces packets, and a `StreamHub` fans them out to every
-connected viewer.
+A small Go module for broadcasting H.264 video to many WebRTC viewers. A
+`VideoSource` (e.g. FFmpeg) produces packets, and a `Broadcaster` fans them out
+to every connected viewer.
+
+- **Lazy** — the source starts on the first viewer and stops when the last one
+  leaves, so nothing is encoded while nobody is watching.
+- **Transport-agnostic** — the library only deals in SDP strings. Signalling
+  (websocket, HTTP, MQTT, ...) is entirely up to you.
 
 ## Install
 
@@ -16,29 +21,40 @@ go get github.com/KunalDuran/webrtcast
 ## Use as a library
 
 ```go
-import webrtcstream "github.com/KunalDuran/webrtcast"
+import "github.com/KunalDuran/webrtcast"
 
-source := webrtcstream.NewFFmpegSource() // or your own VideoSource
-hub := webrtcstream.NewStreamHub(source)
-go hub.Start()
+source := webrtcast.NewFFmpegSource()  // or your own VideoSource
+caster := webrtcast.New(source)
+defer caster.Close()
 
-// When an offer arrives over your signalling websocket:
-err := webrtcstream.HandleOffer(conn, offerSDP, hub, nil)
+// When an offer arrives over your own signalling channel, answer it.
+// The returned SDP answer is self-contained (ICE already gathered) —
+// send it back however you like.
+answer, err := caster.Connect(offerSDP)
 ```
 
-Implement the `VideoSource` interface to plug in your own video source:
+Custom STUN/TURN servers:
+
+```go
+caster := webrtcast.New(source, webrtcast.WithICEServers([]webrtc.ICEServer{
+	{URLs: []string{"stun:stun.l.google.com:19302"}},
+	{URLs: []string{"turn:turn.example.com"}, Username: "u", Credential: "p"},
+}))
+```
+
+Plug in your own video source by implementing `VideoSource`:
 
 ```go
 type VideoSource interface {
 	Start() error
-	ReadPacket() ([]byte, error)
+	ReadFrame() (Frame, error) // one complete H.264 access unit + its duration
 	Stop() error
 }
 ```
 
 ## Run the example
 
-The `cmd/webrtcast` program wires the library to a signalling server.
+The `cmd/webrtcast` program wires the library to a websocket signalling server.
 It needs `ffmpeg` on your `PATH`.
 
 ```sh
@@ -48,11 +64,9 @@ go run ./cmd/webrtcast -signal "ws://localhost:8080/ws?topic=signal"
 ## Layout
 
 ```
-.                       library package "webrtcstream"
+.                       library package "webrtcast" (no transport deps)
 ├── video_source.go     VideoSource interface
 ├── ffmpeg.go           FFmpegSource implementation
-├── stream_hub.go       StreamHub: fans video out to viewers
-├── streamer.go         single-track streaming helper
-├── signaling.go        SignalMessage + HandleOffer
-└── cmd/webrtcast/  runnable example program
+├── broadcaster.go      Broadcaster: lazy source + fan-out + SDP answering
+└── cmd/webrtcast/      runnable websocket example
 ```
