@@ -26,15 +26,15 @@ func annexB(nals ...[]byte) []byte {
 	return buf.Bytes()
 }
 
-// newTestSource wires an FFmpegSource to read from an in-memory stream instead
-// of a real ffmpeg process.
-func newTestSource(t *testing.T, stream []byte) *FFmpegSource {
+// newTestSource wires a CommandSource to read from an in-memory stream instead
+// of a real encoder process.
+func newTestSource(t *testing.T, stream []byte) *CommandSource {
 	t.Helper()
 	r, err := h264reader.NewReader(bytes.NewReader(stream))
 	if err != nil {
 		t.Fatalf("new reader: %v", err)
 	}
-	return &FFmpegSource{fps: 30, reader: r}
+	return &CommandSource{fps: 30, reader: r}
 }
 
 func TestReadFrameGroupsAccessUnits(t *testing.T) {

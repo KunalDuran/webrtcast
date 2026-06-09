@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>webrtcast viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    font: 15px/1.4 system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 20px;
+  }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .row { display: flex; gap: 8px; width: min(720px, 100%); }
+  input {
+    flex: 1;
+    padding: 8px 10px;
+    border: 1px solid #444;
+    border-radius: 6px;
+    background: #1c1c1c;
+    color: #eee;
+    font: inherit;
+  }
+  button {
+    padding: 8px 16px;
+    border: 0;
+    border-radius: 6px;
+    background: #2d7;
+    color: #042;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  button.stop { background: #e55; color: #300; }
+  video {
+    width: min(720px, 100%);
+    aspect-ratio: 16 / 9;
+    background: #000;
+    border-radius: 8px;
+  }
+  #status {
+    width: min(720px, 100%);
+    font-size: 13px;
+    color: #9ad;
+    min-height: 1.4em;
+  }
+  #status.error { color: #f88; }
+</style>
+</head>
+<body>
+  <h1>webrtcast viewer</h1>
+
+  <div class="row">
+    <input id="url" value="ws://192.168.29.15:8090/ws?topic=signal&role=subscriber">
+    <button id="connect">Connect</button>
+    <button id="disconnect" class="stop" disabled>Disconnect</button>
+  </div>
+
+  <video id="video" autoplay playsinline muted controls></video>
+  <div id="status">Idle.</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const urlInput   = $("url");
+const connectBtn = $("connect");
+const disconnBtn = $("disconnect");
+const video      = $("video");
+const statusEl   = $("status");
+
+let ws = null;
+let pc = null;
+
+function setStatus(msg, isError = false) {
+  statusEl.textContent = msg;
+  statusEl.classList.toggle("error", isError);
+  (isError ? console.error : console.log)("[viewer]", msg);
+}
+
+function setConnected(on) {
+  connectBtn.disabled = on;
+  disconnBtn.disabled = !on;
+  urlInput.disabled = on;
+}
+
+// Wait until ICE gathering finishes so the offer is self-contained
+// (non-trickle), matching the answer the Go broadcaster sends back.
+function waitForIceGathering(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", check);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+async function connect() {
+  const url = urlInput.value.trim();
+  if (!url) { setStatus("Enter a signalling URL.", true); return; }
+
+  setConnected(true);
+  setStatus("Connecting to signalling server…");
+
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
+
+  // The broadcaster only sends video; we just want to receive it.
+  pc.addTransceiver("video", { direction: "recvonly" });
+
+  pc.ontrack = (e) => {
+    setStatus("Receiving video stream.");
+    video.srcObject = e.streams[0];
+  };
+
+  pc.onconnectionstatechange = () => {
+    setStatus("Peer connection: " + pc.connectionState);
+    if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+      cleanup();
+    }
+  };
+
+  ws = new WebSocket(url);
+
+  ws.onopen = async () => {
+    setStatus("Signalling connected. Creating offer…");
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGathering(pc);
+      ws.send(JSON.stringify({
+        type: "offer",
+        sdp: pc.localDescription.sdp,
+      }));
+      setStatus("Offer sent. Waiting for answer…");
+    } catch (err) {
+      setStatus("Offer failed: " + err, true);
+      cleanup();
+    }
+  };
+
+  ws.onmessage = async (ev) => {
+    let sig;
+    try { sig = JSON.parse(await ev.data.text()); }
+    catch { return; }
+
+    if (sig.type !== "answer") return;
+    setStatus("Answer received. Establishing media…");
+    try {
+      await pc.setRemoteDescription({ type: "answer", sdp: sig.sdp });
+    } catch (err) {
+      setStatus("Failed to apply answer: " + err, true);
+      cleanup();
+    }
+  };
+
+  ws.onerror = () => setStatus("Signalling socket error.", true);
+  ws.onclose = () => {
+    if (disconnBtn.disabled === false) setStatus("Signalling socket closed.");
+  };
+}
+
+function cleanup() {
+  if (ws) { try { ws.close(); } catch {} ws = null; }
+  if (pc) { try { pc.close(); } catch {} pc = null; }
+  video.srcObject = null;
+  setConnected(false);
+}
+
+function disconnect() {
+  setStatus("Disconnected.");
+  cleanup();
+}
+
+connectBtn.addEventListener("click", connect);
+disconnBtn.addEventListener("click", disconnect);
+</script>
+</body>
+</html>

@@ -9,7 +9,6 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"log"
 
 	"github.com/gorilla/websocket"
@@ -25,20 +24,18 @@ type signalMessage struct {
 }
 
 func main() {
-	signalURL := flag.String(
-		"signal",
-		"ws://YOUR_SIGNAL_SERVER/ws?topic=signal",
-		"signalling server websocket URL",
-	)
-	flag.Parse()
-
+	signalURL := "ws://192.168.29.15:8090/ws?topic=signal&role=producer"
 	// The source is started lazily by the broadcaster on the first viewer, so
 	// nothing is encoded until someone actually connects.
-	source := webrtcast.NewFFmpegSource()
+	//
+	// On the Pi the camera's hardware H.264 encoder does the work — software
+	// encoding (NewFFmpegSource) cannot keep up on a Pi Zero. To test off-device
+	// with a synthetic pattern instead, swap in webrtcast.NewFFmpegSource().
+	source := webrtcast.NewPiCameraSource()
 	caster := webrtcast.New(source)
 	defer caster.Close()
 
-	conn, _, err := websocket.DefaultDialer.Dial(*signalURL, nil)
+	conn, _, err := websocket.DefaultDialer.Dial(signalURL, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
