@@ -56,9 +56,12 @@ func WithSize(size string) FFmpegOption {
 // WithInputArgs replaces the ffmpeg arguments that select the video source,
 // e.g. WithInputArgs("-i", "rtsp://camera/stream") or WithInputArgs("-f",
 // "v4l2", "-i", "/dev/video0"). When unset, a generated test pattern derived
-// from WithSize and WithFPS is used. The real-time pacing flag "-re" is always
-// prepended, and the raw Annex-B output stage is always appended, so include
-// neither here — only the input-selection arguments.
+// from WithSize and WithFPS is used. The raw Annex-B output stage is always
+// appended, so omit it here — supply only the input-selection arguments.
+//
+// The real-time pacing flag "-re" is NOT added for custom inputs: it is meant
+// for files and generated streams, and on a live capture (v4l2, RTSP) it is
+// redundant and only adds latency. Add it yourself if your input needs it.
 func WithInputArgs(args ...string) FFmpegOption {
 	return func(c *ffmpegConfig) { c.inputArgs = args }
 }
@@ -83,11 +86,14 @@ func NewFFmpegSource(opts ...FFmpegOption) *CommandSource {
 		opt(c)
 	}
 
-	args := []string{"-re"}
+	var args []string
 	if len(c.inputArgs) > 0 {
 		args = append(args, c.inputArgs...)
 	} else {
+		// "-re" paces the generated test pattern at real time; it belongs only
+		// on file/generated inputs, not on live captures (see WithInputArgs).
 		args = append(args,
+			"-re",
 			"-f", "lavfi",
 			"-i", fmt.Sprintf("testsrc=size=%s:rate=%d", c.size, c.fps),
 		)

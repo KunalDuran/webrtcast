@@ -1,32 +1,46 @@
 package webrtcast
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
-// Broadcaster fans a single VideoSource out to many WebRTC viewers.
+// Restart backoff bounds used when a source crashes while viewers remain.
+const (
+	initialRestartBackoff = 500 * time.Millisecond
+	maxRestartBackoff     = 30 * time.Second
+)
+
+// Broadcaster fans a single video source out to many WebRTC viewers.
 //
-// The video source is started lazily when the first viewer connects and
-// stopped again once the last viewer disconnects, so nothing is encoded while
-// nobody is watching.
+// The source is built and started lazily when the first viewer connects (via
+// the SourceFunc passed to New) and stopped again once the last viewer
+// disconnects, so nothing is encoded while nobody is watching. If the source
+// crashes while viewers are still connected, it is rebuilt and restarted with
+// exponential backoff.
 //
 // Broadcaster is transport-agnostic: it only deals in SDP strings. How offers
 // and answers travel between you and the viewer (websocket, HTTP, ...) is left
 // entirely to the caller.
 type Broadcaster struct {
-	source     VideoSource
-	iceServers []webrtc.ICEServer
+	newSource     SourceFunc
+	iceServers    []webrtc.ICEServer
+	logger        *slog.Logger
+	onSourceError func(error)
 
-	mu      sync.Mutex
-	viewers map[string]*viewer
-	running bool   // is the source started and being pumped?
-	gen     uint64 // identifies the currently running pump goroutine
+	mu        sync.Mutex
+	viewers   map[string]*viewer
+	viewerSeq uint64
+	running   bool               // is a source run active?
+	gen       uint64             // identifies the currently running pump
+	cancel    context.CancelFunc // cancels the active run's source context
 }
 
 // viewer is one connected WebRTC peer and the track we write video into.
@@ -44,11 +58,32 @@ func WithICEServers(servers []webrtc.ICEServer) Option {
 	return func(b *Broadcaster) { b.iceServers = servers }
 }
 
-// New creates a Broadcaster for the given video source.
-func New(source VideoSource, opts ...Option) *Broadcaster {
+// WithLogger sets the logger. If unset, slog.Default() is used. Pass a logger
+// at a higher level (or a discarding handler) to silence the per-viewer
+// state-change chatter.
+func WithLogger(logger *slog.Logger) Option {
+	return func(b *Broadcaster) {
+		if logger != nil {
+			b.logger = logger
+		}
+	}
+}
+
+// OnSourceError registers a callback invoked whenever the source fails — either
+// crashing mid-run or failing to restart. The Broadcaster keeps trying to
+// restart regardless; this hook is for telemetry/alerting. The callback runs on
+// the run goroutine, so it must not block.
+func OnSourceError(fn func(error)) Option {
+	return func(b *Broadcaster) { b.onSourceError = fn }
+}
+
+// New creates a Broadcaster that builds a fresh video source, via newSource,
+// each time a run starts (first viewer, or restart after a crash).
+func New(newSource SourceFunc, opts ...Option) *Broadcaster {
 	b := &Broadcaster{
-		source:  source,
-		viewers: make(map[string]*viewer),
+		newSource: newSource,
+		viewers:   make(map[string]*viewer),
+		logger:    slog.Default(),
 		iceServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 		},
@@ -59,15 +94,16 @@ func New(source VideoSource, opts ...Option) *Broadcaster {
 	return b
 }
 
-var viewerCounter uint64
-
 // Connect answers a viewer's SDP offer and returns the SDP answer.
 //
 // The viewer begins receiving video immediately and is removed automatically
 // when its connection closes. The returned answer already contains its ICE
 // candidates (non-trickle), so you can send it as-is over any transport.
-func (b *Broadcaster) Connect(offerSDP string) (answerSDP string, err error) {
-	id := fmt.Sprintf("viewer-%d", atomic.AddUint64(&viewerCounter, 1))
+//
+// ctx bounds ICE gathering: if it expires (e.g. an unreachable STUN server on a
+// flaky link) Connect returns rather than hanging the caller's signalling loop.
+func (b *Broadcaster) Connect(ctx context.Context, offerSDP string) (answerSDP string, err error) {
+	id := fmt.Sprintf("viewer-%d", atomic.AddUint64(&b.viewerSeq, 1))
 
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: b.iceServers})
 	if err != nil {
@@ -92,7 +128,7 @@ func (b *Broadcaster) Connect(offerSDP string) (answerSDP string, err error) {
 	}
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Println("viewer", id, "state:", state)
+		b.logger.Info("viewer state changed", "viewer", id, "state", state.String())
 		switch state {
 		case webrtc.PeerConnectionStateClosed,
 			webrtc.PeerConnectionStateDisconnected,
@@ -114,18 +150,34 @@ func (b *Broadcaster) Connect(offerSDP string) (answerSDP string, err error) {
 	}
 
 	// Wait for ICE gathering to finish so the answer is self-contained and can
-	// be sent in a single message (non-trickle ICE).
+	// be sent in a single message (non-trickle ICE), but don't wait forever.
 	gatherComplete := webrtc.GatheringCompletePromise(pc)
 	if err = pc.SetLocalDescription(answer); err != nil {
 		return "", fmt.Errorf("set local description: %w", err)
 	}
-	<-gatherComplete
+	select {
+	case <-gatherComplete:
+	case <-ctx.Done():
+		return "", fmt.Errorf("ice gathering: %w", ctx.Err())
+	}
 
 	if err = b.addViewer(id, &viewer{pc: pc, track: track}); err != nil {
 		return "", fmt.Errorf("start source: %w", err)
 	}
 
-	log.Println("viewer", id, "connected")
+	// The connection may have failed or closed during gathering/setup, before
+	// the state-change callback could find this viewer in the map. If so its
+	// removeViewer call no-op'd; drop the now-orphaned viewer ourselves so the
+	// source does not run on for a peer that is already gone.
+	if state := pc.ConnectionState(); state == webrtc.PeerConnectionStateFailed ||
+		state == webrtc.PeerConnectionStateClosed ||
+		state == webrtc.PeerConnectionStateDisconnected {
+		b.removeViewer(id)
+		err = fmt.Errorf("connection %s before setup completed", state)
+		return "", err
+	}
+
+	b.logger.Info("viewer connected", "viewer", id)
 	return pc.LocalDescription().SDP, nil
 }
 
@@ -145,7 +197,7 @@ func (b *Broadcaster) Close() error {
 		delete(b.viewers, id)
 	}
 	if b.running {
-		b.stopSourceLocked()
+		b.stopRunLocked()
 	}
 	b.mu.Unlock()
 
@@ -157,26 +209,21 @@ func (b *Broadcaster) Close() error {
 	return nil
 }
 
-// addViewer registers a viewer, starting the source if it is the first one.
+// addViewer registers a viewer, starting a source run if it is the first one.
 func (b *Broadcaster) addViewer(id string, v *viewer) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if !b.running {
-		if err := b.source.Start(); err != nil {
+		if err := b.startRunLocked(); err != nil {
 			return err
 		}
-		b.running = true
-		b.gen++
-		go b.pump(b.gen)
-		log.Println("source started")
 	}
-
 	b.viewers[id] = v
 	return nil
 }
 
-// removeViewer drops a viewer, stopping the source if it was the last one.
+// removeViewer drops a viewer, stopping the source run if it was the last one.
 func (b *Broadcaster) removeViewer(id string) {
 	b.mu.Lock()
 	v, ok := b.viewers[id]
@@ -186,53 +233,143 @@ func (b *Broadcaster) removeViewer(id string) {
 	}
 	delete(b.viewers, id)
 	if len(b.viewers) == 0 && b.running {
-		b.stopSourceLocked()
+		b.stopRunLocked()
 	}
 	b.mu.Unlock()
 
 	v.pc.Close() // outside the lock — see Close.
-	log.Println("viewer", id, "removed")
+	b.logger.Info("viewer removed", "viewer", id)
 }
 
-// stopSourceLocked stops the source and invalidates the running pump.
-// The caller must hold b.mu.
-func (b *Broadcaster) stopSourceLocked() {
-	b.running = false
-	b.gen++ // make the current pump exit quietly on its next loop
-	if err := b.source.Stop(); err != nil {
-		log.Println("stop source:", err)
+// startRunLocked builds a fresh source, starts it, and launches the run
+// goroutine that pumps it. The caller must hold b.mu. The first start is
+// synchronous so Connect surfaces an immediate failure (e.g. ffmpeg not on
+// PATH); later restarts happen inside the run goroutine.
+func (b *Broadcaster) startRunLocked() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	src := b.newSource()
+	if err := src.Start(ctx); err != nil {
+		cancel()
+		return err
 	}
-	log.Println("source stopped (no viewers)")
+	b.running = true
+	b.gen++
+	b.cancel = cancel
+	go b.run(ctx, src, b.gen)
+	b.logger.Info("source started")
+	return nil
 }
 
-// pump reads frames from the source and writes them to every viewer until the
-// source ends or this pump is superseded (gen no longer matches).
-func (b *Broadcaster) pump(gen uint64) {
+// stopRunLocked signals the active run to stop. The caller must hold b.mu.
+//
+// It only cancels the run's context — which kills the source process and
+// unblocks ReadFrame — and bumps gen so any in-flight pump write is discarded.
+// The run goroutine owns the actual teardown (reaping the process via
+// src.Stop), so there is never concurrent teardown of the same source.
+func (b *Broadcaster) stopRunLocked() {
+	b.running = false
+	b.gen++ // make the current pump discard any write it is mid-way through
+	if b.cancel != nil {
+		b.cancel()
+		b.cancel = nil
+	}
+	b.logger.Info("source stopping (no viewers)")
+}
+
+// run owns one source's lifetime: it pumps frames until the source ends, reaps
+// it, and — unless the run was stopped on purpose — rebuilds and restarts it
+// with exponential backoff. gen ties this run's writes to the Broadcaster; once
+// superseded, its writes are dropped.
+func (b *Broadcaster) run(ctx context.Context, src VideoSource, gen uint64) {
+	backoff := initialRestartBackoff
 	for {
-		frame, err := b.source.ReadFrame()
-		if err != nil {
-			b.mu.Lock()
-			if gen == b.gen { // the source ended on its own (e.g. crashed)
-				b.running = false
-				log.Println("source ended:", err)
-			}
-			b.mu.Unlock()
+		err := b.pump(ctx, src, gen)
+		src.Stop() // reap the process now that reading has stopped
+
+		// pump returns nil only when this run was superseded (intentional stop);
+		// a cancelled context is likewise an intentional stop.
+		if err == nil || ctx.Err() != nil {
+			b.logger.Info("source stopped")
 			return
+		}
+
+		// The source ended on its own — treat as a crash and restart.
+		b.logger.Error("source ended unexpectedly; restarting", "err", err)
+		b.notifySourceError(err)
+
+		// Back off, then build and start a fresh source. Retry the start itself
+		// with backoff too, since the failure may be transient (camera busy).
+		for {
+			select {
+			case <-ctx.Done():
+				b.logger.Info("source stopped")
+				return
+			case <-time.After(backoff):
+			}
+			backoff = nextBackoff(backoff)
+
+			src = b.newSource()
+			if startErr := src.Start(ctx); startErr != nil {
+				b.logger.Error("source restart failed", "err", startErr)
+				b.notifySourceError(startErr)
+				continue
+			}
+			break
+		}
+		backoff = initialRestartBackoff // reset once a restart succeeds
+	}
+}
+
+// pump reads frames from src and writes them to every viewer until src ends
+// (returns the error) or this run is superseded (returns nil).
+//
+// Frames are written outside b.mu: it snapshots the current tracks under the
+// lock, releases it, then packetizes and writes. Holding the lock across N
+// WriteSample calls every frame would block Connect and removeViewer for the
+// duration of every frame's fan-out.
+func (b *Broadcaster) pump(ctx context.Context, src VideoSource, gen uint64) error {
+	for {
+		frame, err := src.ReadFrame()
+		if err != nil {
+			return err
 		}
 
 		b.mu.Lock()
-		if gen != b.gen { // superseded by stopSourceLocked
+		if gen != b.gen { // superseded by stopRunLocked / a newer run
 			b.mu.Unlock()
-			return
+			return nil
 		}
+		tracks := make([]*webrtc.TrackLocalStaticSample, 0, len(b.viewers))
+		ids := make([]string, 0, len(b.viewers))
 		for id, v := range b.viewers {
-			if err := v.track.WriteSample(media.Sample{
-				Data:     frame.Data,
-				Duration: frame.Duration,
-			}); err != nil {
-				log.Println("write to", id, "failed:", err)
-			}
+			tracks = append(tracks, v.track)
+			ids = append(ids, id)
 		}
 		b.mu.Unlock()
+
+		sample := media.Sample{Data: frame.Data, Duration: frame.Duration}
+		for i, t := range tracks {
+			if err := t.WriteSample(sample); err != nil {
+				// A track whose pc just closed errors here; removeViewer will
+				// clear it shortly. Log and keep serving everyone else.
+				b.logger.Warn("write to viewer failed", "viewer", ids[i], "err", err)
+			}
+		}
 	}
+}
+
+// notifySourceError invokes the OnSourceError hook if one was registered.
+func (b *Broadcaster) notifySourceError(err error) {
+	if b.onSourceError != nil {
+		b.onSourceError(err)
+	}
+}
+
+// nextBackoff doubles d, capped at maxRestartBackoff.
+func nextBackoff(d time.Duration) time.Duration {
+	d *= 2
+	if d > maxRestartBackoff {
+		return maxRestartBackoff
+	}
+	return d
 }

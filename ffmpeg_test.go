@@ -77,3 +77,41 @@ func TestReadFrameGroupsAccessUnits(t *testing.T) {
 		t.Errorf("frame 3 err = %v, want EOF", err)
 	}
 }
+
+// TestReadFrameInlineParameterSets covers the --inline case, where SPS/PPS are
+// repeated mid-stream before each keyframe. They arrive *after* the previous
+// P-slice, and must start a new access unit so they travel with the IDR they
+// precede — not get glued onto the previous frame.
+func TestReadFrameInlineParameterSets(t *testing.T) {
+	stream := annexB(
+		nal(0x41, 'p'), // AU1: non-IDR slice
+		nal(0x67, 'S'), // AU2: SPS  (inline — must begin a new AU here)
+		nal(0x68, 'P'), //      PPS
+		nal(0x65, 'I'), //      IDR slice
+		nal(0x41, 'q'), // AU3: non-IDR slice (lost at EOF, by design)
+	)
+	src := newTestSource(t, stream)
+
+	// First frame is the lone P-slice; the SPS that follows must flush it.
+	first, err := src.ReadFrame()
+	if err != nil {
+		t.Fatalf("frame 1: %v", err)
+	}
+	if want := annexB(nal(0x41, 'p')); !bytes.Equal(first.Data, want) {
+		t.Errorf("frame 1 data = %v, want %v", first.Data, want)
+	}
+
+	// Second frame bundles the inline SPS/PPS with the IDR they belong to.
+	second, err := src.ReadFrame()
+	if err != nil {
+		t.Fatalf("frame 2: %v", err)
+	}
+	want := annexB(nal(0x67, 'S'), nal(0x68, 'P'), nal(0x65, 'I'))
+	if !bytes.Equal(second.Data, want) {
+		t.Errorf("frame 2 data = %v, want %v", second.Data, want)
+	}
+
+	if _, err := src.ReadFrame(); !errors.Is(err, io.EOF) {
+		t.Errorf("frame 3 err = %v, want EOF", err)
+	}
+}
