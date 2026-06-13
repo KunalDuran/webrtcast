@@ -30,17 +30,22 @@ const (
 // and answers travel between you and the viewer (websocket, HTTP, ...) is left
 // entirely to the caller.
 type Broadcaster struct {
+	// viewerSeq is accessed with atomic.AddUint64 and MUST stay the first field
+	// of the struct: on 32-bit platforms (e.g. ARM) Go only guarantees 64-bit
+	// alignment for the first word of an allocated struct, and an unaligned
+	// 64-bit atomic op panics. Keep it at the top.
+	viewerSeq uint64
+
 	newSource     SourceFunc
 	iceServers    []webrtc.ICEServer
 	logger        *slog.Logger
 	onSourceError func(error)
 
-	mu        sync.Mutex
-	viewers   map[string]*viewer
-	viewerSeq uint64
-	running   bool               // is a source run active?
-	gen       uint64             // identifies the currently running pump
-	cancel    context.CancelFunc // cancels the active run's source context
+	mu      sync.Mutex
+	viewers map[string]*viewer
+	running bool               // is a source run active?
+	gen     uint64             // identifies the currently running pump (mutex-guarded, not atomic)
+	cancel  context.CancelFunc // cancels the active run's source context
 }
 
 // viewer is one connected WebRTC peer and the track we write video into.
